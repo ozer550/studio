@@ -27,6 +27,8 @@ import urls from 'shared/urls';
 // When this many seconds pass without a syncable
 // change being registered, sync changes!
 const SYNC_IF_NO_CHANGES_FOR = 0.5;
+// Set ping interval to 25 seconds
+const WEBSOCKET_PING_INTERVAL = 3000;
 
 let socket;
 // Flag to check if a sync is currently active.
@@ -51,6 +53,119 @@ const ChangeTypeMapFields = {
   [CHANGE_TYPES.PUBLISHED]: commonFields.concat(['version_notes', 'language']),
   [CHANGE_TYPES.SYNCED]: commonFields.concat(['attributes', 'tags', 'files', 'assessment_items']),
 };
+
+class WebSocketAdapter {
+  constructor() {
+    // Websocket Connection URL
+    this.websocketUrl = new URL(
+      `/ws/sync_socket/${window.CHANNEL_EDIT_GLOBAL.channel_id}/`,
+      window.location.href
+    );
+
+    //Set Protocol
+    this.websocketUrl.protocol = window.location.protocol == 'https:' ? 'wss:' : 'ws:';
+
+    //Create connection
+    this.socket;
+    this.openSocketConnection();
+    this.debouncePingMessage = debounce(() => {
+      this.socket.send(
+        JSON.stringify({
+          ping: 'PING!',
+        })
+      );
+      this.debouncePingMessage();
+    }, WEBSOCKET_PING_INTERVAL);
+
+    this.debouncePingMessage();
+  }
+
+  close() {
+    this.socket.close();
+  }
+
+  openSocketConnection() {
+    //From th existing url we create a new connection
+    // add the required event listners
+    this.socket = new WebSocket(this.websocketUrl);
+
+    //Add Event Listners
+    // Connection opened
+    this.socket.addEventListener('open', () => {
+      console.log('Websocket connected');
+    });
+
+    // Listen for any errors due to which connection may be closed.
+    this.socket.addEventListener('error', event => {
+      console.log('WebSocket error: ', event);
+    });
+
+    this.socket.addEventListener('close', () => {
+      //need to resync using sync api then create a new connection
+      syncChanges();
+      console.log('websocket dropped connection!');
+      this.openSocketConnection();
+    });
+
+    //On message handler
+    this.socket.addEventListener('message', async e => {
+      const data = JSON.parse(e.data);
+      const user = await Session.getSession();
+      console.log(data);
+      if (data.task) {
+        Task.setTasks([data.task]);
+      }
+      if (data.response_payload && data.response_payload.allowed) {
+        try {
+          handleAllowed(data.response_payload.allowed);
+        } catch (err) {
+          console.log(err);
+        }
+      }
+      if (data.response_payload && data.response_payload.disallowed) {
+        try {
+          handleDisallowed(data.response_payload.disallowed);
+        } catch (err) {
+          console.log(err);
+        }
+      }
+      if (data.change) {
+        try {
+          handleReturnedChanges([data.change]);
+          handleMaxRevs([data.change], user.id);
+        } catch (err) {
+          console.log(err);
+        }
+      }
+      if (data.errored) {
+        try {
+          handleErrors([data.errored]);
+          handleMaxRevs([data.errored], user.id);
+        } catch (err) {
+          console.log(err);
+        }
+      }
+      if (data.success) {
+        try {
+          handleSuccesses([data.success]);
+          handleMaxRevs([data.success], user.id);
+        } catch (err) {
+          console.log(err);
+        }
+      }
+    });
+  }
+
+  // Interface to send Changes
+  send(requestPayload) {
+    this.socket.send(
+      JSON.stringify({
+        payload: requestPayload,
+      })
+    );
+    this.debouncePingMessage();
+  }
+}
 
 function isSyncableChange(change) {
   const src = change.source || '';
@@ -260,11 +375,7 @@ async function WebsocketSendChanges() {
     // in order to still call our change cleanup code.
     if (changes.length) {
       requestPayload.changes = changes;
-      socket.send(
-        JSON.stringify({
-          payload: requestPayload,
-        })
-      );
+      socket.send(requestPayload);
     }
   }
   syncActive = false;
@@ -424,70 +535,73 @@ export function startSyncing() {
   // Initiate a sync immediately in case any data
   // is left over in the database.
   debouncedSyncChanges();
-  const websocketUrl = new URL(
-    `/ws/sync_socket/${window.CHANNEL_EDIT_GLOBAL.channel_id}/`,
-    window.location.href
-  );
-  websocketUrl.protocol = window.location.protocol == 'https:' ? 'wss:' : 'ws:';
 
-  socket = new WebSocket(websocketUrl);
+  socket = new WebSocketAdapter();
+  socket.close();
+  // const websocketUrl = new URL(
+  //   `/ws/sync_socket/${window.CHANNEL_EDIT_GLOBAL.channel_id}/`,
+  //   window.location.href
+  // );
+  // websocketUrl.protocol = window.location.protocol == 'https:' ? 'wss:' : 'ws:';
 
-  // Connection opened
-  socket.addEventListener('open', () => {
-    console.log('Websocket connected');
-  });
+  // socket = new WebSocket(websocketUrl);
 
-  // Listen for any errors due to which connection may be closed.
-  socket.addEventListener('error', event => {
-    console.log('WebSocket error: ', event);
-  });
+  // // Connection opened
+  // socket.addEventListener('open', () => {
+  //   console.log('Websocket connected');
+  // });
 
-  socket.addEventListener('message', async e => {
-    const data = JSON.parse(e.data);
-    const user = await Session.getSession();
-    console.log(data);
-    if (data.task) {
-      Task.setTasks([data.task]);
-    }
-    if (data.response_payload && data.response_payload.allowed) {
-      try {
-        handleAllowed(data.response_payload.allowed);
-      } catch (err) {
-        console.log(err);
-      }
-    }
-    if (data.response_payload && data.response_payload.disallowed) {
-      try {
-        handleDisallowed(data.response_payload.disallowed);
-      } catch (err) {
-        console.log(err);
-      }
-    }
-    if (data.change) {
-      try {
-        handleReturnedChanges([data.change]);
-        handleMaxRevs([data.change], user.id);
-      } catch (err) {
-        console.log(err);
-      }
-    }
-    if (data.errored) {
-      try {
-        handleErrors([data.errored]);
-        handleMaxRevs([data.errored], user.id);
-      } catch (err) {
-        console.log(err);
-      }
-    }
-    if (data.success) {
-      try {
-        handleSuccesses([data.success]);
-        handleMaxRevs([data.success], user.id);
-      } catch (err) {
-        console.log(err);
-      }
-    }
-  });
+  // // Listen for any errors due to which connection may be closed.
+  // socket.addEventListener('error', event => {
+  //   console.log('WebSocket error: ', event);
+  // });
+
+  // socket.addEventListener('message', async e => {
+  //   const data = JSON.parse(e.data);
+  //   const user = await Session.getSession();
+  //   console.log(data);
+  //   if (data.task) {
+  //     Task.setTasks([data.task]);
+  //   }
+  //   if (data.response_payload && data.response_payload.allowed) {
+  //     try {
+  //       handleAllowed(data.response_payload.allowed);
+  //     } catch (err) {
+  //       console.log(err);
+  //     }
+  //   }
+  //   if (data.response_payload && data.response_payload.disallowed) {
+  //     try {
+  //       handleDisallowed(data.response_payload.disallowed);
+  //     } catch (err) {
+  //       console.log(err);
+  //     }
+  //   }
+  //   if (data.change) {
+  //     try {
+  //       handleReturnedChanges([data.change]);
+  //       handleMaxRevs([data.change], user.id);
+  //     } catch (err) {
+  //       console.log(err);
+  //     }
+  //   }
+  //   if (data.errored) {
+  //     try {
+  //       handleErrors([data.errored]);
+  //       handleMaxRevs([data.errored], user.id);
+  //     } catch (err) {
+  //       console.log(err);
+  //     }
+  //   }
+  //   if (data.success) {
+  //     try {
+  //       handleSuccesses([data.success]);
+  //       handleMaxRevs([data.success], user.id);
+  //     } catch (err) {
+  //       console.log(err);
+  //     }
+  //   }
+  // });
 
   db.on('changes', handleChanges);
 }
