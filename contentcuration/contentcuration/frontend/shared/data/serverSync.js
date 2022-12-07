@@ -10,6 +10,7 @@ import db from './db';
 import applyChanges from './applyRemoteChanges';
 import { INDEXEDDB_RESOURCES } from './registry';
 import { Channel, Session, Task } from './resources';
+import { Sync } from './streams';
 import {
   ACTIVE_CHANNELS,
   CHANGES_TABLE,
@@ -54,46 +55,49 @@ const ChangeTypeMapFields = {
   [CHANGE_TYPES.SYNCED]: commonFields.concat(['attributes', 'tags', 'files', 'assessment_items']),
 };
 
-class WebSocketAdapter {
-  constructor() {
+class WebSocketAdapter extends Sync {
+  constructor(channelId) {
+    super();
     // Websocket Connection URL
     this.websocketUrl = new URL(
-      `/ws/sync_socket/${window.CHANNEL_EDIT_GLOBAL.channel_id}/`,
+      `/ws/sync_socket/${channelId}/`,
       window.location.href
     );
 
     //Set Protocol
-    this.websocketUrl.protocol = window.location.protocol == 'https:' ? 'wss:' : 'ws:';
+    this.websocketUrl.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-    //Create connection
-    this.socket;
-    this.openSocketConnection();
+    // Create connection
+    this._connectionReady = this.openSocketConnection();
+    this._healthy = true;
+    this.closed = false;
+
     this.debouncePingMessage = debounce(() => {
-      this.socket.send(
-        JSON.stringify({
-          ping: 'PING!',
-        })
-      );
-      this.debouncePingMessage();
+      this.ping();
     }, WEBSOCKET_PING_INTERVAL);
+  }
 
-    this.debouncePingMessage();
+  get ready() {
+    return this._connectionReady.then(() => {
+      return this._healthy ? Promise.resolve() : Promise.reject();
+    });
   }
 
   close() {
     this.socket.close();
   }
 
+  /**
+   * Opens the websocket connection and returns a promise that's resolved when the connection is ready
+   *
+   * @return {Promise<void>}
+   */
   openSocketConnection() {
     //From th existing url we create a new connection
     // add the required event listners
     this.socket = new WebSocket(this.websocketUrl);
 
     //Add Event Listners
-    // Connection opened
-    this.socket.addEventListener('open', () => {
-      console.log('Websocket connected');
-    });
 
     // Listen for any errors due to which connection may be closed.
     this.socket.addEventListener('error', event => {
@@ -102,69 +106,91 @@ class WebSocketAdapter {
 
     this.socket.addEventListener('close', () => {
       //need to resync using sync api then create a new connection
-      syncChanges();
+      // syncChanges();
       console.log('websocket dropped connection!');
-      this.openSocketConnection();
+      this.debouncePingMessage.cancel();
+      this.closed = true;
     });
 
     //On message handler
     this.socket.addEventListener('message', async e => {
+      this._healthy = true;
+      this.debouncePingMessage();
+
       const data = JSON.parse(e.data);
-      const user = await Session.getSession();
-      console.log(data);
-      if (data.task) {
-        Task.setTasks([data.task]);
-      }
-      if (data.response_payload && data.response_payload.allowed) {
-        try {
-          handleAllowed(data.response_payload.allowed);
-        } catch (err) {
-          console.log(err);
+
+      if (data.response_payload) {
+        this._writeToStream(data.response_payload);
+      } else {
+        const response = pick(data, ['task', 'change', 'success', 'errored']);
+        for (let key in response) {
+          // Wrap all in an array
+          response[key] = [response[key]];
         }
+        this._writeToStream(response);
       }
-      if (data.response_payload && data.response_payload.disallowed) {
-        try {
-          handleDisallowed(data.response_payload.disallowed);
-        } catch (err) {
-          console.log(err);
-        }
-      }
-      if (data.change) {
-        try {
-          handleReturnedChanges([data.change]);
-          handleMaxRevs([data.change], user.id);
-        } catch (err) {
-          console.log(err);
-        }
-      }
-      if (data.errored) {
-        try {
-          handleErrors([data.errored]);
-          handleMaxRevs([data.errored], user.id);
-        } catch (err) {
-          console.log(err);
-        }
-      }
-      if (data.success) {
-        try {
-          handleSuccesses([data.success]);
-          handleMaxRevs([data.success], user.id);
-        } catch (err) {
-          console.log(err);
-        }
-      }
+    });
+
+    return new Promise(resolve => {
+      this.socket.addEventListener('open', () => {
+        console.log('Websocket connected');
+        resolve();
+        this.debouncePingMessage();
+      });
     });
   }
 
   // Interface to send Changes
-  send(requestPayload) {
-    this.socket.send(
-      JSON.stringify({
-        payload: requestPayload,
-      })
-    );
-    this.debouncePingMessage();
+  send(message) {
+    if (this.closed) {
+      this._connectionReady = this.openSocketConnection();
+      this.closed = false;
+      return Promise.reject();
+    }
+
+    return this.ready.then(() => {
+      this._healthy = false;
+      this.socket.send(
+        JSON.stringify(message)
+      );
+      this.debouncePingMessage();
+    });
   }
+
+  ping() {
+    return this.send({
+      ping: 'PING!',
+    });
+  }
+}
+
+function createResponseWritableStream() {
+  let user;
+  return new WritableStream({
+    async start() {
+      user = await Session.getSession();
+    },
+    async write(response) {
+      try {
+        await Promise.all([
+          handleDisallowed(get(response, ['disallowed'], [])),
+          handleAllowed(get(response, ['allowed'], [])),
+          handleReturnedChanges(get(response, ['changes'], [])),
+          handleErrors(get(response, ['errors'], [])),
+          handleSuccesses(get(response, ['successes'], [])),
+          handleMaxRevs(
+            get(response, ['changes'], [])
+              .concat(get(response, ['errors'], []))
+              .concat(get(response, ['successes'], [])),
+            user.id
+          ),
+          handleTasks(get(response, ['tasks'], [])),
+        ]);
+      } catch (err) {
+        console.error('There was an error updating change status: ', err); // eslint-disable-line no-console
+      }
+    }
+  });
 }
 
 function isSyncableChange(change) {
@@ -366,8 +392,7 @@ async function WebsocketSendChanges() {
       .filter(c => !c.synced);
     const changesToSync = await syncableChanges.toArray();
     // By the time we get here, our changesToSync Array should
-    // have every change we want to sync to the server, so we
-    // can now trim it down to only what is needed to transmit over the wire.
+    // have every change wn to only what is needed to transmit over the wire.
     // TODO: remove moves when a delete change is present for an object,
     // because a delete will wipe out the move.
     const changes = changesToSync.map(trimChangeForSync);
@@ -375,109 +400,105 @@ async function WebsocketSendChanges() {
     // in order to still call our change cleanup code.
     if (changes.length) {
       requestPayload.changes = changes;
-      socket.send(requestPayload);
+      socket.send({ payload: requestPayload })
+        .catch(() => {
+          syncChanges();
+        });
     }
   }
   syncActive = false;
 }
-async function syncChanges() {
-  // Note: we could in theory use Dexie syncable for what
-  // we are doing here, but I can't find a good way to make
-  // it ignore our regular API calls for seeding the database
-  // Also, the pattern it expects for server interactions would
-  // require greater backend rearchitecting to focus our server-client
-  // interactions on changes to objects, with consistent and resolvable
-  // revisions. We will do this for now, but we have the option of doing
-  // something more involved and better architectured in the future.
 
-  syncActive = true;
-
-  // Track the maxRevision at this moment so that we can ignore any changes that
-  // might have come in during processing - leave them for the next cycle.
-  // This is the primary key of the change objects, so the collection is ordered by this
-  // by default - if we just grab the last object, we can get the key from there.
-  const [lastChange, user] = await Promise.all([
-    db[CHANGES_TABLE].orderBy('rev').last(),
-    Session.getSession(),
-  ]);
-  if (!user) {
-    // If not logged in, nothing to do.
-    return;
+class SyncChanges extends Sync {
+  constructor() {
+    super();
+    this.active = false;
   }
 
-  const now = Date.now();
-  const channelIds = Object.entries(user[ACTIVE_CHANNELS] || {})
-    .filter(([id, time]) => id && time > now - CHANNEL_SYNC_KEEP_ALIVE_INTERVAL)
-    .map(([id]) => id);
-  const channel_revs = {};
-  for (let channelId of channelIds) {
-    channel_revs[channelId] = get(user, [MAX_REV_KEY, channelId], 0);
-  }
+  async sync() {
+    // Note: we could in theory use Dexie syncable for what
+    // we are doing here, but I can't find a good way to make
+    // it ignore our regular API calls for seeding the database
+    // Also, the pattern it expects for server interactions would
+    // require greater backend rearchitecting to focus our server-client
+    // interactions on changes to objects, with consistent and resolvable
+    // revisions. We will do this for now, but we have the option of doing
+    // something more involved and better architectured in the future.
 
-  const unAppliedChanges = await db[CHANGES_TABLE].orderBy('server_rev')
-    .filter(c => c.synced && !c.errors && !c.disallowed)
-    .toArray();
+    this.active = true;
 
-  const requestPayload = {
-    changes: [],
-    channel_revs,
-    user_rev: user.user_rev || 0,
-    unapplied_revs: unAppliedChanges.map(c => c.server_rev).filter(Boolean),
-  };
-
-  if (lastChange) {
-    const changesMaxRevision = lastChange.rev;
-    const syncableChanges = db[CHANGES_TABLE].where('rev')
-      .belowOrEqual(changesMaxRevision)
-      .filter(c => !c.synced);
-    const changesToSync = await syncableChanges.toArray();
-    // By the time we get here, our changesToSync Array should
-    // have every change we want to sync to the server, so we
-    // can now trim it down to only what is needed to transmit over the wire.
-    // TODO: remove moves when a delete change is present for an object,
-    // because a delete will wipe out the move.
-    const changes = changesToSync.map(trimChangeForSync).filter(Boolean);
-    // Create a promise for the sync - if there is nothing to sync just resolve immediately,
-    // in order to still call our change cleanup code.
-    if (changes.length) {
-      requestPayload.changes = changes;
+    // Track the maxRevision at this moment so that we can ignore any changes that
+    // might have come in during processing - leave them for the next cycle.
+    // This is the primary key of the change objects, so the collection is ordered by this
+    // by default - if we just grab the last object, we can get the key from there.
+    const [lastChange, user] = await Promise.all([
+      db[CHANGES_TABLE].orderBy('rev').last(),
+      Session.getSession(),
+    ]);
+    if (!user) {
+      // If not logged in, nothing to do.
+      return;
     }
-  }
-  try {
-    // The response from the sync endpoint has the format:
-    // {
-    //   "disallowed": [],
-    //   "allowed": [],
-    //   "changes": [],
-    //   "errors": [],
-    //   "successes": [],
-    // }
 
-    const response = await client.post(urls['sync'](), requestPayload);
+    const now = Date.now();
+    const channelIds = Object.entries(user[ACTIVE_CHANNELS] || {})
+      .filter(([id, time]) => id && time > now - CHANNEL_SYNC_KEEP_ALIVE_INTERVAL)
+      .map(([id]) => id);
+    const channel_revs = {};
+    for (let channelId of channelIds) {
+      channel_revs[channelId] = get(user, [MAX_REV_KEY, channelId], 0);
+    }
 
+    const unAppliedChanges = await db[CHANGES_TABLE].orderBy('server_rev')
+      .filter(c => c.synced && !c.errors && !c.disallowed)
+      .toArray();
+
+    const requestPayload = {
+      changes: [],
+      channel_revs,
+      user_rev: user.user_rev || 0,
+      unapplied_revs: unAppliedChanges.map(c => c.server_rev).filter(Boolean),
+    };
+
+    if (lastChange) {
+      const changesMaxRevision = lastChange.rev;
+      const syncableChanges = db[CHANGES_TABLE].where('rev')
+        .belowOrEqual(changesMaxRevision)
+        .filter(c => !c.synced);
+      const changesToSync = await syncableChanges.toArray();
+      // By the time we get here, our changesToSync Array should
+      // have every change we want to sync to the server, so we
+      // can now trim it down to only what is needed to transmit over the wire.
+      // TODO: remove moves when a delete change is present for an object,
+      // because a delete will wipe out the move.
+      const changes = changesToSync.map(trimChangeForSync).filter(Boolean);
+      // Create a promise for the sync - if there is nothing to sync just resolve immediately,
+      // in order to still call our change cleanup code.
+      if (changes.length) {
+        requestPayload.changes = changes;
+      }
+    }
     try {
-      await Promise.all([
-        handleDisallowed(get(response, ['data', 'disallowed'], [])),
-        handleAllowed(get(response, ['data', 'allowed'], [])),
-        handleReturnedChanges(get(response, ['data', 'changes'], [])),
-        handleErrors(get(response, ['data', 'errors'], [])),
-        handleSuccesses(get(response, ['data', 'successes'], [])),
-        handleMaxRevs(
-          get(response, ['data', 'changes'], [])
-            .concat(get(response, ['data', 'errors'], []))
-            .concat(get(response, ['data', 'successes'], [])),
-          user.id
-        ),
-        handleTasks(get(response, ['data', 'tasks'], [])),
-      ]);
+      // The response from the sync endpoint has the format:
+      // {
+      //   "disallowed": [],
+      //   "allowed": [],
+      //   "changes": [],
+      //   "errors": [],
+      //   "successes": [],
+      // }
+
+      const response = await client.post(urls['sync'](), requestPayload);
+      await this._writeToStream(response);
     } catch (err) {
-      console.error('There was an error updating change status: ', err); // eslint-disable-line no-console
+      // There was an error during syncing, log, but carry on
+      console.warn('There was an error during syncing with the backend: ', err); // eslint-disable-line no-console
     }
-  } catch (err) {
-    // There was an error during syncing, log, but carry on
-    console.warn('There was an error during syncing with the backend: ', err); // eslint-disable-line no-console
+    this.active = false;
   }
-  syncActive = false;
+}
+
+async function syncChanges() {
 }
 
 const debouncedSyncChanges = debounce(() => {
@@ -534,74 +555,28 @@ let intervalTimer;
 export function startSyncing() {
   // Initiate a sync immediately in case any data
   // is left over in the database.
-  debouncedSyncChanges();
+  // debouncedSyncChanges();
+  //
+  // const listOfChannelIds = [];
+  // const sockets = [];
+  // for (let channelId of listOfChannelIds) {
+  //   sockets.push(new WebSocketAdapter(channelId));
+  // }
 
-  socket = new WebSocketAdapter();
-  socket.close();
-  // const websocketUrl = new URL(
-  //   `/ws/sync_socket/${window.CHANNEL_EDIT_GLOBAL.channel_id}/`,
-  //   window.location.href
-  // );
-  // websocketUrl.protocol = window.location.protocol == 'https:' ? 'wss:' : 'ws:';
+  const api = new SyncChanges();
+  socket = new WebSocketAdapter(window.CHANNEL_EDIT_GLOBAL.channel_id);
+  const responseWritableStream = createResponseWritableStream();
 
-  // socket = new WebSocket(websocketUrl);
-
-  // // Connection opened
-  // socket.addEventListener('open', () => {
-  //   console.log('Websocket connected');
+  // const merge = new ReadableStream({
+  //   pull(controller) {
+  //     return Promise((resolve, reject) => {
+  //
+  //     });
+  //   }
   // });
 
-  // // Listen for any errors due to which connection may be closed.
-  // socket.addEventListener('error', event => {
-  //   console.log('WebSocket error: ', event);
-  // });
-
-  // socket.addEventListener('message', async e => {
-  //   const data = JSON.parse(e.data);
-  //   const user = await Session.getSession();
-  //   console.log(data);
-  //   if (data.task) {
-  //     Task.setTasks([data.task]);
-  //   }
-  //   if (data.response_payload && data.response_payload.allowed) {
-  //     try {
-  //       handleAllowed(data.response_payload.allowed);
-  //     } catch (err) {
-  //       console.log(err);
-  //     }
-  //   }
-  //   if (data.response_payload && data.response_payload.disallowed) {
-  //     try {
-  //       handleDisallowed(data.response_payload.disallowed);
-  //     } catch (err) {
-  //       console.log(err);
-  //     }
-  //   }
-  //   if (data.change) {
-  //     try {
-  //       handleReturnedChanges([data.change]);
-  //       handleMaxRevs([data.change], user.id);
-  //     } catch (err) {
-  //       console.log(err);
-  //     }
-  //   }
-  //   if (data.errored) {
-  //     try {
-  //       handleErrors([data.errored]);
-  //       handleMaxRevs([data.errored], user.id);
-  //     } catch (err) {
-  //       console.log(err);
-  //     }
-  //   }
-  //   if (data.success) {
-  //     try {
-  //       handleSuccesses([data.success]);
-  //       handleMaxRevs([data.success], user.id);
-  //     } catch (err) {
-  //       console.log(err);
-  //     }
-  //   }
-  // });
+  socket.readableStream.pipeTo(responseWritableStream);
+  // api.readableStream.pipeTo(responseWritableStream);
 
   db.on('changes', handleChanges);
 }
