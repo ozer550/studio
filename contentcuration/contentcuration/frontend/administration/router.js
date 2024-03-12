@@ -4,6 +4,7 @@ import ChannelTable from './pages/Channels/ChannelTable';
 import ChannelDetails from './pages/Channels/ChannelDetails';
 import UserTable from './pages/Users/UserTable';
 import UserDetails from './pages/Users/UserDetails';
+import FlaggedTabel from './pages/flagged/FlaggedTabel.vue';
 
 const router = new VueRouter({
   routes: [
@@ -28,6 +29,11 @@ const router = new VueRouter({
       path: '/users/:userId',
       props: true,
       component: UserDetails,
+    },
+    {
+      name: RouteNames.FLAGGED,
+      path: '/flagged/',
+      component: FlaggedTabel,
     },
     // Catch-all redirect to channels tab
     {

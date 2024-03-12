@@ -9,6 +9,9 @@
         <VTab :to="usersLink">
           {{ $tr('usersLabel') }}
         </VTab>
+        <VTab :to="flaggedLink">
+          {{ $tr('flaggedLabel') }}
+        </VTab>
       </template>
     </AppBar>
     <VContent>
@@ -55,6 +58,13 @@
           name: RouteNames.CHANNELS,
         };
       },
+
+      flaggedLink() {
+        return {
+          name: RouteNames.FLAGGED,
+        };
+      },
+
       usersLink() {
         return {
           name: RouteNames.USERS,
@@ -64,6 +74,7 @@
     $trs: {
       channelsLabel: 'Channels',
       usersLabel: 'Users',
+      flaggedLabel: 'flagged content',
     },
   };
 
